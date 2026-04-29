@@ -8,7 +8,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROXY="http://localhost:3456"
 
-# 读取 token
+# 读取 token（从安全配置目录）
 TOKEN=""
 if [ -n "${1:-}" ]; then
   TOKEN="$1"
@@ -18,7 +18,8 @@ else
     const path = require('path');
     const os = require('os');
     try {
-      const d = JSON.parse(fs.readFileSync(path.join(os.tmpdir(), 'cdp-proxy-token.json'), 'utf-8'));
+      const configDir = process.env.CDP_PROXY_CONFIG_DIR || path.join(os.homedir(), '.config', 'geo-sentinel');
+      const d = JSON.parse(fs.readFileSync(path.join(configDir, 'auth-token.json'), 'utf-8'));
       console.log(d.token);
     } catch { console.log(''); }
   " 2>/dev/null)

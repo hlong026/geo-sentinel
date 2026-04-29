@@ -11,8 +11,19 @@ import os from 'node:os';
 import net from 'node:net';
 
 const PORT = parseInt(process.env.CDP_PROXY_PORT || '3456');
-const MANAGED_TABS_FILE = path.join(os.tmpdir(), 'cdp-proxy-managed-tabs.json'); // P0: 持久化托管 tab
-const AUTH_TOKEN_FILE = path.join(os.tmpdir(), 'cdp-proxy-token.json'); // P3: 自动生成的 token
+// 安全存储目录：~/.config/geo-sentinel/，权限 0700
+const CONFIG_DIR = process.env.CDP_PROXY_CONFIG_DIR || path.join(os.homedir(), '.config', 'geo-sentinel');
+const MANAGED_TABS_FILE = path.join(CONFIG_DIR, 'managed-tabs.json');
+const AUTH_TOKEN_FILE = path.join(CONFIG_DIR, 'auth-token.json');
+const MAX_BODY_SIZE = 1024 * 1024; // 1MB 请求体上限
+const MAX_RECORDING_FRAMES = 3000; // 录屏最大帧数（约 5 分钟 @10fps）
+
+// 确保配置目录存在且权限安全
+try {
+  fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
+  // 如果目录已存在（mkdir 不修改权限），显式设置
+  fs.chmodSync(CONFIG_DIR, 0o700);
+} catch { /* 忽略 */ }
 let ws = null;
 let cmdId = 0;
 const pending = new Map(); // id -> {resolve, timer}
@@ -197,11 +208,16 @@ async function connect() {
         for (const [targetId, recording] of recordings.entries()) {
           if (recording.sessionId === sessionId || sessionId === undefined) {
             if (recording.active) {
-              recording.frames.push({
-                data: frameData,
-                timestamp: Date.now(),
-                metadata,
-              });
+              if (recording.frames.length < MAX_RECORDING_FRAMES) {
+                recording.frames.push({
+                  data: frameData,
+                  timestamp: Date.now(),
+                  metadata,
+                });
+              } else {
+                recording.active = false;
+                console.warn(`[CDP Proxy] 录屏达到 ${MAX_RECORDING_FRAMES} 帧上限，自动停止`);
+              }
             }
             break;
           }
@@ -331,18 +347,22 @@ async function waitForLoad(sessionId, timeoutMs = 15000) {
   });
 }
 
-// --- 读取 POST body ---
-async function readBody(req) {
+// --- 读取 POST body（带大小限制） ---
+async function readBody(req, maxSize = MAX_BODY_SIZE) {
   let body = '';
-  for await (const chunk of req) body += chunk;
+  for await (const chunk of req) {
+    body += chunk;
+    if (body.length > maxSize) {
+      throw new Error(`请求体超过 ${Math.round(maxSize / 1024)}KB 限制`);
+    }
+  }
   return body;
 }
 
-// --- P3: Token 认证（自动生成 + 持久化） ---
-// 优先读环境变量，否则自动生成并写入 AUTH_TOKEN_FILE
+// --- Token 认证（默认启用，自动生成 + 持久化到安全目录） ---
+// 优先读环境变量，否则自动生成并写入 AUTH_TOKEN_FILE（权限 0600）
 let AUTH_TOKEN = process.env.CDP_PROXY_TOKEN || null;
 if (!AUTH_TOKEN) {
-  // 尝试从持久化文件读取
   try {
     if (fs.existsSync(AUTH_TOKEN_FILE)) {
       const stored = JSON.parse(fs.readFileSync(AUTH_TOKEN_FILE, 'utf-8'));
@@ -350,13 +370,11 @@ if (!AUTH_TOKEN) {
     }
   } catch { /* 忽略 */ }
   if (!AUTH_TOKEN) {
-    // 自动生成 token
     const { randomBytes } = await import('node:crypto');
-    AUTH_TOKEN = randomBytes(16).toString('hex');
+    AUTH_TOKEN = randomBytes(32).toString('hex'); // 256-bit token
   }
-  // 写入持久化文件
   try {
-    fs.writeFileSync(AUTH_TOKEN_FILE, JSON.stringify({ token: AUTH_TOKEN, createdAt: new Date().toISOString() }));
+    fs.writeFileSync(AUTH_TOKEN_FILE, JSON.stringify({ token: AUTH_TOKEN, createdAt: new Date().toISOString() }), { mode: 0o600 });
   } catch { /* 忽略 */ }
 }
 
@@ -471,6 +489,12 @@ const server = http.createServer(async (req, res) => {
       const sid = await ensureSession(q.target);
       const body = await readBody(req);
       const expr = body || q.expr || 'document.title';
+      // 基本危险表达式检查（防止明显的恶意代码）
+      if (/(?:^|[\s;])eval\s*\(/.test(expr) || /(?:^|[\s;])Function\s*\(/.test(expr)) {
+        res.statusCode = 400;
+        res.end(JSON.stringify({ error: '不允许使用 eval() 或 Function() 构造器' }));
+        return;
+      }
       const resp = await sendCDP('Runtime.evaluate', {
         expression: expr,
         returnByValue: true,
@@ -654,8 +678,18 @@ const server = http.createServer(async (req, res) => {
         key: keyDef.key,
         code: keyDef.code,
         windowsVirtualKeyCode: keyDef.keyCode,
-        modifiers: 0,
+        modifiers,
       }, sid);
+
+      // 释放 modifier keys
+      if (modifiers) {
+        const modKeyMap = { 2: { key: 'Control', code: 'ControlLeft' }, 1: { key: 'Alt', code: 'AltLeft' }, 4: { key: 'Meta', code: 'MetaLeft' }, 8: { key: 'Shift', code: 'ShiftLeft' } };
+        for (const [mod, keyDef2] of Object.entries(modKeyMap)) {
+          if (modifiers & Number(mod)) {
+            await sendCDP('Input.dispatchKeyEvent', { type: 'keyUp', key: keyDef2.key, code: keyDef2.code, windowsVirtualKeyCode: 0, modifiers: 0 }, sid);
+          }
+        }
+      }
 
       res.end(JSON.stringify({ pressed: key }));
     }
@@ -956,6 +990,13 @@ const server = http.createServer(async (req, res) => {
       const expr = body || q.expr || 'document.body.innerText';
       const frameSrc = q.frameSrc || '';
 
+      // 安全检查：与 /eval 一致
+      if (/(?:^|[\s;])eval\s*\(/.test(expr) || /(?:^|[\s;])Function\s*\(/.test(expr)) {
+        res.statusCode = 400;
+        res.end(JSON.stringify({ error: '不允许使用 eval() 或 Function() 构造器' }));
+        return;
+      }
+
       // 1. 从 Chrome HTTP 端点获取所有 targets（包括跨域 iframe）
       const allTargets = await new Promise((resolve, reject) => {
         http.get(`http://127.0.0.1:${chromePort}/json`, (resp) => {
@@ -967,8 +1008,14 @@ const server = http.createServer(async (req, res) => {
         }).on('error', () => resolve([]));
       });
 
-      // 2. 查找匹配的 iframe target
-      const iframeTargets = allTargets.filter(t => t.type === 'iframe' && t.url && t.url.includes(frameSrc));
+      // 2. 查找匹配的 iframe target（优先精确匹配路径组件，降级子串匹配）
+      let iframeTargets = allTargets.filter(t => {
+        if (t.type !== 'iframe' || !t.url) return false;
+        try { return new URL(t.url).pathname.includes(frameSrc); } catch { return false; }
+      });
+      if (iframeTargets.length === 0) {
+        iframeTargets = allTargets.filter(t => t.type === 'iframe' && t.url && t.url.includes(frameSrc));
+      }
 
       if (iframeTargets.length === 0) {
         res.statusCode = 400;
@@ -1184,12 +1231,14 @@ async function main() {
   });
 }
 
-// 防止未捕获异常导致进程崩溃
+// 未捕获异常：记录后退出，让进程管理器重启
 process.on('uncaughtException', (e) => {
-  console.error('[CDP Proxy] 未捕获异常:', e.message);
+  console.error('[CDP Proxy] 未捕获异常（进程将退出）:', e.message);
+  process.exit(1);
 });
 process.on('unhandledRejection', (e) => {
   console.error('[CDP Proxy] 未处理拒绝:', e?.message || e);
+  process.exit(1);
 });
 
 // P0: 进程退出时清理托管 tab

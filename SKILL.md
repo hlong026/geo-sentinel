@@ -1,17 +1,17 @@
 ---
 name: geo-sentinel
-description: 多平台情报扫描——输入自然语言查询，自动操控 Chrome 浏览器在 Grok/Gemini(Deep Research)/ChatGPT(Deep Research)/Perplexity 四平台搜索采集，Google 搜索作为第五验证源，对所有链接逐条打开验证内容与日期匹配，输出带核查状态的结构化事件报告。自包含技能，不依赖其他技能。支持每日定时触发。
+description: 多平台情报扫描——输入自然语言查询，自动操控 Chrome 浏览器在 Gemini(Deep Research)/ChatGPT(Deep Research)/Perplexity 三平台搜索采集，Google 搜索作为第四验证源，对所有链接逐条打开验证内容与日期匹配，输出带核查状态的结构化事件报告。自包含技能，不依赖其他技能。支持每日定时触发。
 origin: custom
 ---
 
 # Geo Sentinel — 多平台情报扫描
 
-自包含的情报扫描技能。安装此技能即可完成从查询到报告的全流程。
+情报扫描技能。不依赖其他 Claude 技能，但需要 Node.js 22+、Chrome 浏览器（开启 CDP 远程调试）、dokobot CLI 和 python3。
 
 ## 工作流总览
 
 ```
-用户查询 → 解析意图 → [Grok + Gemini(DR) + ChatGPT(DR) + Perplexity 并行采集] → 日期硬过滤 → 交叉比对分级 → Google 验证 → 逐条打开链接验证 → 结构化报告
+用户查询 → 解析意图 → [Gemini(DR) + ChatGPT(DR) + Perplexity 并行采集] → 日期硬过滤 → 交叉比对分级 → Google 验证 → 逐条打开链接验证 → 结构化报告
 ```
 
 ---
@@ -25,6 +25,7 @@ origin: custom
 | CDP 远程调试 | `chrome://inspect/#remote-debugging` → 勾选 Allow | — |
 | dokobot CLI | `npm install -g @dokobot/cli` + `dokobot install-bridge` | 任意 |
 | defuddle CLI（可选） | `npm install -g defuddle-cli` | 任意 |
+| python3 | 系统自带或 `brew install python3` | 3.8+ |
 
 ### 登录要求
 
@@ -44,16 +45,17 @@ bash ${CLAUDE_SKILL_DIR}/scripts/check-deps.sh
 
 脚本会检查 Node.js、Chrome 调试端口，并启动 CDP Proxy（端口 3456）。Proxy 20 分钟无请求自动退出。
 
-### 安全：Token 认证（P3）
+### 安全：Token 认证（默认启用）
 
-设置环境变量启用认证（强烈建议）：
+CDP Proxy 自动生成 256-bit token 并存储在 `~/.config/geo-sentinel/auth-token.json`（权限 0600）。
+
+也可通过环境变量覆盖：
 
 ```bash
-export CDP_PROXY_TOKEN="$(openssl rand -hex 16)"
-echo "Token: $CDP_PROXY_TOKEN"
+export CDP_PROXY_TOKEN="$(openssl rand -hex 32)"
 ```
 
-启用后，所有请求需携带 `?token=XXX` 或 `Authorization: Bearer XXX`。不设置则跳过认证（向后兼容）。
+所有请求需携带 `?token=XXX` 或 `Authorization: Bearer XXX`。Token 文件首次生成后打印到日志。
 
 ---
 
@@ -188,9 +190,9 @@ cdp_call() {
 
 | 项目 | 首选选择器 | 降级选择器 |
 |------|-----------|-----------|
-| 编辑器 | `.tiptap.ProseMirror` | `[contenteditable="true"]` |
-| 提交按钮 | `button[aria-label="提交"]` | `button[aria-label="Submit"]`, `form button[type="submit"]` |
-| 响应容器 | `.markdown`（最后一个） | — |
+| 编辑器 | `.tiptap.ProseMirror` | `[contenteditable="true"]`, `[role="textbox"]` |
+| 提交按钮 | `button[aria-label="提交"]` | `button[aria-label="Submit"]`, `form button[type="submit"]`, `[role="button"]` 含"提交/Submit" |
+| 响应容器 | `.markdown`（最后一个） | `[role="article"]` |
 | 完成检测 | `.markdown` 内容 > 100 字符 | — |
 
 **操作流程**：
@@ -218,10 +220,10 @@ curl -s -X POST "http://localhost:3456/eval?target=$T" \
 
 | 项目 | 首选选择器 | 降级选择器 |
 |------|-----------|-----------|
-| 编辑器 | `.ql-editor.textarea` | `[contenteditable="true"].ql-editor` |
-| 发送按钮 | `button[aria-label="发送"]` | `button[aria-label="Send"]`, `button.send` |
-| 工具按钮 | `button.toolbox-drawer-button` | — |
-| Deep Research | `.mat-mdc-list-item` 包含 "Deep Research" | — |
+| 编辑器 | `.ql-editor.textarea` | `[contenteditable="true"].ql-editor`, `[role="textbox"]` |
+| 发送按钮 | `button[aria-label="发送"]` | `button[aria-label="Send"]`, `button.send`, `[role="button"]` 含"发送/Send" |
+| 工具按钮 | `button.toolbox-drawer-button` | `[aria-label*="工具"]`, `[aria-label*="Tools"]` |
+| Deep Research | `.mat-mdc-list-item` 包含 "Deep Research" | `[role="option"]` 含 "Deep Research" |
 | 响应容器 | `model-response` 或 `message-content` | `document.body.innerText`（降级，含噪声） |
 
 **操作流程**：
@@ -262,9 +264,9 @@ curl -s -X POST "http://localhost:3456/eval?target=$T" \
 
 | 项目 | 首选选择器 | 降级选择器 |
 |------|-----------|-----------|
-| DR 入口 | `a[data-testid="deep-research-sidebar-item"]` | — |
-| 编辑器 | `#prompt-textarea` | `.ProseMirror[contenteditable]` |
-| 发送按钮 | `button[data-testid="send-button"]` | `button[aria-label="Send"]` |
+| DR 入口 | `a[data-testid="deep-research-sidebar-item"]` | `[role="link"]` 含 "Deep Research" |
+| 编辑器 | `#prompt-textarea` | `.ProseMirror[contenteditable]`, `[role="textbox"]` |
+| 发送按钮 | `button[data-testid="send-button"]` | `button[aria-label="Send"]`, `[role="button"]` 含"Send" |
 | 响应容器 | **跨域 iframe**（`/evalFrame`） | `.markdown`（非 DR 模式） |
 | 完成检测 | iframe 高度 > 200px | — |
 
@@ -307,9 +309,9 @@ curl -s "http://localhost:3456/close?target=$T"
 
 | 项目 | 首选选择器 | 降级选择器 |
 |------|-----------|-----------|
-| 编辑器 | `#ask-input` | `textarea`, `[contenteditable]` |
-| 提交按钮 | `button[aria-label="Submit"]` | — |
-| 响应容器 | `div.prose`（最后一个） | — |
+| 编辑器 | `#ask-input` | `textarea`, `[contenteditable]`, `[role="textbox"]` |
+| 提交按钮 | `button[aria-label="Submit"]` | `[role="button"]` 含"Submit", `form button[type="submit"]` |
+| 响应容器 | `div.prose`（最后一个） | `[role="article"]` |
 
 **操作流程**：
 ```bash
@@ -354,15 +356,81 @@ Do NOT include events that happened before [起始日期], even if their effects
 
 向用户确认解析结果后再继续。
 
+#### 敏感内容防护（API 1301 错误）
+
+当 API 返回 **HTTP 400 + code 1301**（内容审核拦截）时，说明查询或生成内容触发了安全过滤。按以下策略处理：
+
+**触发时机**：可能在以下环节遇到——
+- 向 AI 平台发送查询时（平台自身审核）
+- CDP Proxy 读取平台响应内容时（本地 API 代理审核）
+- 最终生成报告时（本地 API 代理审核）
+
+**处理流程**：
+
+```
+检测到 1301 错误
+    │
+    ├─ 发生在「单平台采集」阶段
+    │   → 记录该平台为「⚠️ 敏感内容拦截，已跳过」
+    │   → 继续其余平台采集
+    │   → 该平台的事件从最终报告中排除
+    │
+    ├─ 发生在「链接验证」阶段
+    │   → 跳过当前链接，标记「⚠️ 内容审核拦截，未验证」
+    │   → 继续验证下一条链接
+    │
+    ├─ 发生在「最终报告生成」阶段
+    │   → 尝试拆分报告为多个小节逐段输出
+    │   → 识别触发拦截的具体段落，删除后重新生成
+    │   → 在报告末尾标注「部分内容因安全审核已省略」
+    │
+    └─ 所有平台均被拦截
+        → 输出降级报告：仅包含已成功采集的部分
+        → 标注「大部分内容因安全审核被拦截，建议调整查询范围」
+```
+
+**查询降级策略** — 如果原始查询触发拦截，自动尝试以下降级查询：
+
+1. **缩小范围**：将全球范围缩小到具体区域（如东南亚、非洲等）
+2. **去敏化**：移除"绑架""袭击"等高风险关键词，改用"安全事件""风险提示"
+3. **拆分查询**：将综合查询拆分为多个子查询分别执行（按区域/按类型）
+4. **切换语言**：用英文查询替代中文查询
+
+降级查询模板：
+
+```
+# 原始查询（可能触发拦截）
+查找过去一周涉及中国海外利益的安全事件
+
+# 降级查询 1（去敏化）
+查找 2026-04-22 至 2026-04-29 期间与中国海外项目相关的风险提示和旅行建议
+
+# 降级查询 2（缩小范围）
+查找 2026-04-22 至 2026-04-29 期间东南亚地区涉及中资企业的商业环境变化
+
+# 降级查询 3（英文）
+Find safety alerts, policy changes, and risk updates affecting Chinese overseas interests from April 22-29, 2026
+```
+
+**关键原则**：宁可降级查询也不中断整个流程。任何被拦截的内容都要在报告中留下记录（「此处因安全审核已省略」），保持报告完整性。
+
 ### Step 2: 多平台采集
 
-对 Grok、Gemini(DR)、ChatGPT(DR)、Perplexity 四平台并行采集。
+对 Gemini(DR)、ChatGPT(DR)、Perplexity 三平台并行采集。
 
-**P3: 并行限流** — 分两批执行，避免同时操作 4 个 tab 导致 Chrome 资源不足：
-- **第一批**（并行）：Grok + Perplexity（常规搜索，30-60 秒完成）
+> ⚠️ Grok 平台已禁用，不参与采集。
+
+**P3: 并行限流** — 分两批执行，避免同时操作多个 tab 导致 Chrome 资源不足：
+- **第一批**：Perplexity（常规搜索，30-60 秒完成）
 - **第二批**（并行）：Gemini(DR) + ChatGPT(DR)（Deep Research，2-5 分钟完成）
 
 如果某个平台失败，跳过并记录错误，用其余平台继续。
+
+### 已禁用平台
+
+| 平台 | 状态 | 原因 |
+|------|------|------|
+| Grok | ❌ 已禁用 | 无法正常使用 |
 
 **任务开始前**调用 `/cleanup` 清理残留 tab。**任务结束后**关闭所有创建的 tab。
 
@@ -373,7 +441,9 @@ Do NOT include events that happened before [起始日期], even if their effects
 **不得包含**：影响延续类、之前签署类、长期趋势类事件。
 **宁可漏报，不可误报**。
 
-### Step 4: 交叉比对与分级（五源交叉）
+### Step 4: 交叉比对与分级（四源交叉）
+
+> Grok 已禁用，当前信息源为 Gemini、ChatGPT、Perplexity、Google 四个。
 
 | 级别 | 条件 | 标签 |
 |------|------|------|
@@ -410,7 +480,7 @@ dokobot doko read '<URL>' --local --timeout 30
 
 ### Step 7: 输出结构化报告
 
-保存到 `01-收集箱/` 目录。模板见原报告格式。
+保存到 `01-收集箱/` 目录（如不存在会自动创建）。文件名格式：`情报扫描 YYYY-MM-DD.md`。模板见原报告格式。
 
 ---
 
@@ -434,6 +504,8 @@ dokobot doko read '<URL>' --local --timeout 30
 16. **ChatGPT Deep Research 响应在跨域 iframe 中，必须用 `/evalFrame`**
 17. **ChatGPT 编辑器可能残留旧文本，提交前必须清空**
 18. **Gemini Deep Research 需要手动点击"开始研究"确认方案**
+19. **API 1301 敏感内容拦截时跳过当前步骤继续执行，不中断整个流程**
+20. **所有被拦截的内容必须在报告中留痕（标注「因安全审核已省略」）**
 
 ---
 
@@ -453,8 +525,8 @@ bash ${CLAUDE_SKILL_DIR}/scripts/daily-scan.sh
 
 ```bash
 crontab -e
-# 每天早上 8:00 执行
-0 8 * * * bash /Users/honor.pei/Obsidian/mind/.claude/skills/geo-sentinel/scripts/daily-scan.sh >> /tmp/geo-sentinel/cron.log 2>&1
+# 每天早上 8:00 执行（替换 YOUR_VAULT_PATH 为实际 vault 路径）
+0 8 * * * bash YOUR_VAULT_PATH/.claude/skills/geo-sentinel/scripts/daily-scan.sh >> /tmp/geo-sentinel/cron.log 2>&1
 ```
 
 ---
@@ -473,6 +545,10 @@ crontab -e
 | dokobot 失败 | 回退到 defuddle 或 curl |
 | Tab 泄漏 | `/cleanup` 端点 + 进程退出自动清理 |
 | 全流程超时 | 15 分钟总超时，输出已完成的部分结果 |
+| API 1301 敏感内容拦截（单平台） | 记录拦截，跳过该平台，继续其余平台采集 |
+| API 1301 敏感内容拦截（链接验证） | 跳过当前链接，标记 `⚠️ 内容审核拦截，未验证`，继续下一条 |
+| API 1301 敏感内容拦截（报告生成） | 拆分段落逐段输出，删除触发拦截的段落，标注「部分内容因安全审核已省略」 |
+| API 1301 所有平台均被拦截 | 执行查询降级策略（去敏化/拆分/切换语言/缩小范围），输出降级报告 |
 
 ---
 
@@ -480,7 +556,7 @@ crontab -e
 
 | 文件 | 平台 |
 |------|------|
-| `references/site-patterns/grok.com.md` | Grok |
+| ~~`references/site-patterns/grok.com.md`~~ | ~~Grok~~（已禁用） |
 | `references/site-patterns/gemini.google.com.md` | Gemini |
 | `references/site-patterns/chatgpt.com.md` | ChatGPT |
 | `references/site-patterns/perplexity.ai.md` | Perplexity |
